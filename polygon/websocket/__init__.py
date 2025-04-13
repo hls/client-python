@@ -7,14 +7,85 @@ import asyncio
 import ssl
 import certifi
 from .models import *
-from websockets.client import connect, WebSocketClientProtocol
-from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError
+from picows import WSFrame, WSListener, WSMsgType, WSCloseCode, WSTransport, ws_connect
 from ..logging import get_logger
 import logging
 from ..exceptions import AuthError
 
 env_key = "POLYGON_API_KEY"
 logger = get_logger("WebSocketClient")
+
+
+class PolygonWSListener(WSListener):
+    def __init__(self, client):
+        self.client = client
+        self.transport = None
+        self.processor = None
+        self.reconnects = 0
+        
+    def on_ws_connected(self, transport: WSTransport):
+        """Called when WebSocket connection is established"""
+        self.transport = transport
+        logger.debug("connected")
+        # Send auth message
+        transport.send(WSMsgType.TEXT, self.client.json.dumps({"action": "auth", "params": self.client.api_key}))
+    
+    def on_ws_frame(self, transport: WSTransport, frame: WSFrame):
+        """Called when a WebSocket frame is received"""
+        if frame.msg_type == WSMsgType.CLOSE:
+            close_code = frame.get_close_code()
+            close_reason = frame.get_close_reason()
+            logger.debug(f"connection closed: code={close_code}, reason={close_reason}")
+            transport.send_close(close_code)
+            return
+            
+        if frame.msg_type != WSMsgType.TEXT:
+            logger.debug(f"Received unexpected frame type: {frame.msg_type}")
+            return
+            
+        message = frame.get_payload_as_ascii_text()
+        
+        # Process the message
+        try:
+            msgJson = self.client.json.loads(message)
+            
+            # Handle auth response
+            if len(msgJson) > 0 and "status" in msgJson[0]:
+                if msgJson[0]["status"] == "auth_failed":
+                    logger.error(f"Authentication failed: {msgJson[0]['message']}")
+                    transport.send_close(WSCloseCode.PROTOCOL_ERROR)
+                    return
+                elif msgJson[0]["status"] == "connected":
+                    logger.debug(f"authed: {message}")
+                    # Handle subscriptions after successful auth
+                    if self.client.schedule_resub:
+                        self.client._handle_subscriptions()
+                    return
+            
+            # Handle regular messages
+            if not self.client.raw:
+                for m in msgJson:
+                    if "ev" in m and m["ev"] == "status":
+                        logger.debug(f"status: {m.get('message', '')}")
+                        continue
+                        
+                cmsg = parse(msgJson, logger)
+            else:
+                cmsg = message
+                
+            if len(cmsg) > 0 and self.client.processor:
+                asyncio.create_task(self.client.processor(cmsg))
+                
+        except Exception as e:
+            logger.error(f"Error processing message: {e}")
+            
+    def on_ws_disconnected(self, transport):
+        """Called when WebSocket connection is closed"""
+        logger.debug("WebSocket connection closed")
+        self.reconnects += 1
+        self.client.scheduled_subs = set(self.client.subs)
+        self.client.subs = set()
+        self.client.schedule_resub = True
 
 
 class WebSocketClient:
@@ -62,7 +133,9 @@ class WebSocketClient:
         self.subscribed = False
         self.subs: Set[str] = set()
         self.max_reconnects = max_reconnects
-        self.websocket: Optional[WebSocketClientProtocol] = None
+        self.transport = None
+        self.listener = PolygonWSListener(self)
+        self.processor = None
         if subscriptions is None:
             subscriptions = []
         self.scheduled_subs: Set[str] = set(subscriptions)
@@ -72,7 +145,6 @@ class WebSocketClient:
         else:
             self.json = json
 
-    # https://websockets.readthedocs.io/en/stable/reference/client.html#opening-a-connection
     async def connect(
         self,
         processor: Union[
@@ -89,73 +161,72 @@ class WebSocketClient:
         :param close_timeout: How long to wait for handshake when calling .close.
         :raises AuthError: If invalid API key is supplied.
         """
-        reconnects = 0
-        logger.debug("connect: %s", self.url)
-        # darwin needs some extra <3
-        ssl_context = None
-        if self.url.startswith("wss://"):
-            ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ssl_context.load_verify_locations(certifi.where())
-
-        async for s in connect(
-            self.url, close_timeout=close_timeout, ssl=ssl_context, **kwargs
-        ):
-            self.websocket = s
+        logger.debug(f"connect: {self.url}")
+        self.processor = processor
+        
+        # For picows, we don't need to explicitly pass SSL context
+        # The library handles secure connections based on the URL scheme
+            
+        while True:
             try:
-                msg = await s.recv()
-                logger.debug("connected: %s", msg)
-                logger.debug("authing...")
-                await s.send(
-                    self.json.dumps({"action": "auth", "params": self.api_key})
+                # Connect using picows
+                _, client = await ws_connect(
+                    lambda: self.listener, 
+                    self.url, 
+                    **kwargs
                 )
-                auth_msg = await s.recv()
-                auth_msg_parsed = self.json.loads(auth_msg)
-                logger.debug("authed: %s", auth_msg)
-                if auth_msg_parsed[0]["status"] == "auth_failed":
-                    raise AuthError(auth_msg_parsed[0]["message"])
-                while True:
-                    if self.schedule_resub:
-                        logger.debug(
-                            "reconciling: %s %s", self.subs, self.scheduled_subs
-                        )
-                        new_subs = self.scheduled_subs.difference(self.subs)
-                        await self._subscribe(new_subs)
-                        old_subs = self.subs.difference(self.scheduled_subs)
-                        await self._unsubscribe(old_subs)
-                        self.subs = self.scheduled_subs
-                        self.subs = set(self.scheduled_subs)
-                        self.schedule_resub = False
-
-                    try:
-                        cmsg: Union[List[WebSocketMessage], Union[str, bytes]] = (
-                            await asyncio.wait_for(s.recv(), timeout=1)
-                        )
-                    except asyncio.TimeoutError:
-                        continue
-
-                    if not self.raw:
-                        # we know cmsg is Data
-                        msgJson = self.json.loads(cmsg)  # type: ignore
-                        for m in msgJson:
-                            if m["ev"] == "status":
-                                logger.debug("status: %s", m["message"])
-                                continue
-                        cmsg = parse(msgJson, logger)
-
-                    if len(cmsg) > 0:
-                        await processor(cmsg)  # type: ignore
-            except ConnectionClosedOK as e:
-                logger.debug("connection closed (OK): %s", e)
-                return
-            except ConnectionClosedError as e:
-                logger.debug("connection closed (ERR): %s", e)
-                reconnects += 1
-                self.scheduled_subs = set(self.subs)
-                self.subs = set()
-                self.schedule_resub = True
-                if self.max_reconnects is not None and reconnects > self.max_reconnects:
-                    return
-                continue
+                self.transport = client.transport
+                
+                # Wait for disconnection
+                await self.transport.wait_disconnected()
+                
+                # Check if we should reconnect
+                if (self.max_reconnects is not None and 
+                    self.listener.reconnects > self.max_reconnects):
+                    logger.debug(f"Max reconnects ({self.max_reconnects}) reached")
+                    break
+                    
+                # Wait before reconnecting
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"Connection error: {e}")
+                await asyncio.sleep(1)
+                
+                # Check if we should reconnect
+                self.listener.reconnects += 1
+                if (self.max_reconnects is not None and 
+                    self.listener.reconnects > self.max_reconnects):
+                    logger.debug(f"Max reconnects ({self.max_reconnects}) reached")
+                    break
+    
+    def _handle_subscriptions(self):
+        """Handle subscription reconciliation"""
+        if not self.transport:
+            return
+            
+        logger.debug(f"reconciling: {self.subs} {self.scheduled_subs}")
+        
+        # Handle new subscriptions
+        new_subs = self.scheduled_subs.difference(self.subs)
+        if new_subs:
+            subs = ",".join(new_subs)
+            logger.debug(f"subbing: {subs}")
+            self.transport.send(WSMsgType.TEXT, 
+                self.json.dumps({"action": "subscribe", "params": subs})
+            )
+            
+        # Handle unsubscriptions
+        old_subs = self.subs.difference(self.scheduled_subs)
+        if old_subs:
+            subs = ",".join(old_subs)
+            logger.debug(f"unsubbing: {subs}")
+            self.transport.send(WSMsgType.TEXT, 
+                self.json.dumps({"action": "unsubscribe", "params": subs})
+            )
+            
+        self.subs = set(self.scheduled_subs)
+        self.schedule_resub = False
 
     def run(
         self,
@@ -180,20 +251,20 @@ class WebSocketClient:
         asyncio.run(self.connect(handle_msg_wrapper, close_timeout, **kwargs))
 
     async def _subscribe(self, topics: Union[List[str], Set[str]]):
-        if self.websocket is None or len(topics) == 0:
+        if self.transport is None or len(topics) == 0:
             return
         subs = ",".join(topics)
-        logger.debug("subbing: %s", subs)
-        await self.websocket.send(
+        logger.debug(f"subbing: {subs}")
+        self.transport.send(WSMsgType.TEXT,
             self.json.dumps({"action": "subscribe", "params": subs})
         )
 
     async def _unsubscribe(self, topics: Union[List[str], Set[str]]):
-        if self.websocket is None or len(topics) == 0:
+        if self.transport is None or len(topics) == 0:
             return
         subs = ",".join(topics)
-        logger.debug("unsubbing: %s", subs)
-        await self.websocket.send(
+        logger.debug(f"unsubbing: {subs}")
+        self.transport.send(WSMsgType.TEXT,
             self.json.dumps({"action": "unsubscribe", "params": subs})
         )
 
@@ -261,8 +332,8 @@ class WebSocketClient:
         """
         logger.debug("closing")
 
-        if self.websocket:
-            await self.websocket.close()
-            self.websocket = None
+        if self.transport:
+            self.transport.send_close(WSCloseCode.GOING_AWAY)
+            self.transport = None
         else:
-            logger.warning("no websocket open to close")
+            logger.warning("no websocket connection open to close")
