@@ -34,8 +34,8 @@ class PolygonWSListener(WSListener):
         """Called when a WebSocket frame is received"""
         if frame.msg_type == WSMsgType.CLOSE:
             close_code = frame.get_close_code()
-            close_reason = frame.get_close_reason()
-            logger.debug(f"connection closed: code={close_code}, reason={close_reason}")
+            close_message = frame.get_close_message()
+            logger.debug(f"connection closed: code={close_code}, reason={close_message}")
             transport.send_close(close_code)
             return
             
