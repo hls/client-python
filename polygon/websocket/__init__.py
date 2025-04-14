@@ -23,6 +23,8 @@ class PolygonWSListener(WSListener):
         self.transport = None
         self.processor = None
         self.reconnects = 0
+        self.subscription_confirmed = False
+        self.last_subscription_time = None
         
     def on_ws_connected(self, transport: WSTransport):
         """Called when WebSocket connection is established"""
@@ -96,8 +98,21 @@ class PolygonWSListener(WSListener):
             # Handle regular messages
             if not self.client.raw:
                 for m in msgJson:
+                    # Check for subscription status messages
                     if "ev" in m and m["ev"] == "status":
-                        logger.info(f"Status message: {m.get('message', '')}")
+                        status_msg = m.get('message', '')
+                        logger.info(f"Status message: {status_msg}")
+                        
+                        # Check for subscription confirmation
+                        if 'successfully subscribed to' in status_msg.lower():
+                            logger.info("Subscription confirmed by Polygon")
+                            self.subscription_confirmed = True
+                        # Check for subscription failure
+                        elif 'failed' in status_msg.lower() and 'subscribe' in status_msg.lower():
+                            logger.error(f"Subscription failed: {status_msg}")
+                            # Trigger resubscription
+                            self.subscription_confirmed = False
+                            self.client.schedule_resub = True
                         continue
                         
                 cmsg = parse(msgJson, logger)
@@ -177,6 +192,17 @@ class WebSocketClient:
         else:
             self.json = json
 
+    async def _verify_subscription(self):
+        """Verify that subscriptions were successful and retry if needed"""
+        # Wait a reasonable time for subscription confirmation
+        await asyncio.sleep(5)
+        
+        # If we haven't received confirmation, try to resubscribe
+        if not self.listener.subscription_confirmed and self.scheduled_subs:
+            logger.warning("No subscription confirmation received, resubscribing...")
+            self.schedule_resub = True
+            self._handle_subscriptions()
+    
     async def connect(
         self,
         processor: Union[
@@ -198,6 +224,13 @@ class WebSocketClient:
         
         # For picows, we don't need to explicitly pass SSL context
         # The library handles secure connections based on the URL scheme
+        
+        # Reset subscription state on new connection
+        self.listener.subscription_confirmed = False
+        self.listener.last_subscription_time = None
+        
+        # Always resubscribe on reconnect
+        self.schedule_resub = True
             
         while True:
             try:
@@ -223,6 +256,7 @@ class WebSocketClient:
                 
             except Exception as e:
                 logger.error(f"Connection error: {e}")
+                traceback.print_exc()
                 await asyncio.sleep(1)
                 
                 # Check if we should reconnect
@@ -232,6 +266,8 @@ class WebSocketClient:
                     logger.info(f"Max reconnects ({self.max_reconnects}) reached")
                     break
     
+
+    
     def _handle_subscriptions(self):
         """Handle subscription reconciliation"""
         if not self.transport:
@@ -239,14 +275,17 @@ class WebSocketClient:
             
         logger.info("Reconciling subscriptions")
         
-        # Handle new subscriptions
-        new_subs = self.scheduled_subs.difference(self.subs)
-        if new_subs:
-            subs = ",".join(new_subs)
-            logger.info(f"Subscribing to: {subs}")
+        # Always send all subscriptions to ensure they're properly registered
+        # This is more reliable than just sending the difference
+        if self.scheduled_subs:
+            subs = ",".join(self.scheduled_subs)
+            logger.info(f"Subscribing to all: {subs}")
             self.transport.send(WSMsgType.TEXT, 
                 self.json.dumps({"action": "subscribe", "params": subs})
             )
+            # Record subscription time for verification
+            self.listener.last_subscription_time = asyncio.get_event_loop().time()
+            self.listener.subscription_confirmed = False
             
         # Handle unsubscriptions
         old_subs = self.subs.difference(self.scheduled_subs)
@@ -259,6 +298,10 @@ class WebSocketClient:
             
         self.subs = set(self.scheduled_subs)
         self.schedule_resub = False
+        
+        # Set up a task to verify subscription was successful
+        if self.scheduled_subs:
+            asyncio.create_task(self._verify_subscription())
 
     def run(
         self,
@@ -286,7 +329,7 @@ class WebSocketClient:
         if self.transport is None or len(topics) == 0:
             return
         subs = ",".join(topics)
-        logger.debug(f"subbing: {subs}")
+        logger.info(f"Subscribing to: {subs}")
         self.transport.send(WSMsgType.TEXT,
             self.json.dumps({"action": "subscribe", "params": subs})
         )
@@ -295,7 +338,7 @@ class WebSocketClient:
         if self.transport is None or len(topics) == 0:
             return
         subs = ",".join(topics)
-        logger.debug(f"unsubbing: {subs}")
+        logger.info(f"Unsubscribing from: {subs}")
         self.transport.send(WSMsgType.TEXT,
             self.json.dumps({"action": "unsubscribe", "params": subs})
         )
