@@ -11,6 +11,7 @@ from picows import WSFrame, WSListener, WSMsgType, WSCloseCode, WSTransport, ws_
 from ..logging import get_logger
 import logging
 from ..exceptions import AuthError
+import traceback
 
 env_key = "POLYGON_API_KEY"
 logger = get_logger("WebSocketClient")
@@ -108,6 +109,7 @@ class PolygonWSListener(WSListener):
                 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
+            traceback.print_exc()
             
     def on_ws_disconnected(self, transport):
         """Called when WebSocket connection is closed"""
