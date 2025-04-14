@@ -26,7 +26,7 @@ class PolygonWSListener(WSListener):
     def on_ws_connected(self, transport: WSTransport):
         """Called when WebSocket connection is established"""
         self.transport = transport
-        logger.debug("connected")
+        logger.info("WebSocket connected")
         # Send auth message
         transport.send(WSMsgType.TEXT, self.client.json.dumps({"action": "auth", "params": self.client.api_key}))
     
@@ -35,19 +35,49 @@ class PolygonWSListener(WSListener):
         if frame.msg_type == WSMsgType.CLOSE:
             close_code = frame.get_close_code()
             close_message = frame.get_close_message()
-            logger.debug(f"connection closed: code={close_code}, reason={close_message}")
+            logger.info(f"WebSocket connection closed: code={close_code}, reason={close_message}")
             transport.send_close(close_code)
             return
             
         if frame.msg_type != WSMsgType.TEXT:
-            logger.debug(f"Received unexpected frame type: {frame.msg_type}")
+            logger.info(f"Received unexpected frame type: {frame.msg_type}")
             return
             
         message = frame.get_payload_as_ascii_text()
         
         # Process the message
         try:
-            msgJson = self.client.json.loads(message)
+            # Handle potential JSON parsing errors more gracefully
+            try:
+                msgJson = self.client.json.loads(message)
+            except json.JSONDecodeError as json_err:
+                # Log detailed information about the JSON parsing error
+                error_pos = json_err.pos
+                # Get a snippet of the message around the error position
+                start_pos = max(0, error_pos - 50)
+                end_pos = min(len(message), error_pos + 50)
+                context = message[start_pos:end_pos]
+                
+                logger.error(f"JSON decode error at position {error_pos}: {json_err}")
+                # Removed verbose debug logging of message context
+                
+                # Try to recover by trimming the message if it appears to be truncated
+                if "unexpected end of data" in str(json_err):
+                    # Find the last complete JSON object by looking for the last '}]' sequence
+                    last_complete = message.rfind('}]')
+                    if last_complete > 0:
+                        try:
+                            # Try parsing up to the last complete object
+                            fixed_msg = message[:last_complete+2]
+                            msgJson = self.client.json.loads(fixed_msg)
+                            logger.info(f"Recovered from truncated JSON by trimming to length {len(fixed_msg)}")
+                        except json.JSONDecodeError:
+                            # If recovery fails, re-raise the original error
+                            raise json_err
+                    else:
+                        raise json_err
+                else:
+                    raise json_err
             
             # Handle auth response
             if len(msgJson) > 0 and "status" in msgJson[0]:
@@ -56,7 +86,7 @@ class PolygonWSListener(WSListener):
                     transport.send_close(WSCloseCode.PROTOCOL_ERROR)
                     return
                 elif msgJson[0]["status"] == "connected":
-                    logger.debug(f"authed: {message}")
+                    logger.info("Authentication successful")
                     # Handle subscriptions after successful auth
                     if self.client.schedule_resub:
                         self.client._handle_subscriptions()
@@ -66,7 +96,7 @@ class PolygonWSListener(WSListener):
             if not self.client.raw:
                 for m in msgJson:
                     if "ev" in m and m["ev"] == "status":
-                        logger.debug(f"status: {m.get('message', '')}")
+                        logger.info(f"Status message: {m.get('message', '')}")
                         continue
                         
                 cmsg = parse(msgJson, logger)
@@ -81,7 +111,7 @@ class PolygonWSListener(WSListener):
             
     def on_ws_disconnected(self, transport):
         """Called when WebSocket connection is closed"""
-        logger.debug("WebSocket connection closed")
+        logger.info("WebSocket connection closed")
         self.reconnects += 1
         self.client.scheduled_subs = set(self.client.subs)
         self.client.subs = set()
@@ -161,7 +191,7 @@ class WebSocketClient:
         :param close_timeout: How long to wait for handshake when calling .close.
         :raises AuthError: If invalid API key is supplied.
         """
-        logger.debug(f"connect: {self.url}")
+        logger.info(f"Connecting to: {self.url}")
         self.processor = processor
         
         # For picows, we don't need to explicitly pass SSL context
@@ -183,7 +213,7 @@ class WebSocketClient:
                 # Check if we should reconnect
                 if (self.max_reconnects is not None and 
                     self.listener.reconnects > self.max_reconnects):
-                    logger.debug(f"Max reconnects ({self.max_reconnects}) reached")
+                    logger.info(f"Max reconnects ({self.max_reconnects}) reached")
                     break
                     
                 # Wait before reconnecting
@@ -197,7 +227,7 @@ class WebSocketClient:
                 self.listener.reconnects += 1
                 if (self.max_reconnects is not None and 
                     self.listener.reconnects > self.max_reconnects):
-                    logger.debug(f"Max reconnects ({self.max_reconnects}) reached")
+                    logger.info(f"Max reconnects ({self.max_reconnects}) reached")
                     break
     
     def _handle_subscriptions(self):
@@ -205,13 +235,13 @@ class WebSocketClient:
         if not self.transport:
             return
             
-        logger.debug(f"reconciling: {self.subs} {self.scheduled_subs}")
+        logger.info("Reconciling subscriptions")
         
         # Handle new subscriptions
         new_subs = self.scheduled_subs.difference(self.subs)
         if new_subs:
             subs = ",".join(new_subs)
-            logger.debug(f"subbing: {subs}")
+            logger.info(f"Subscribing to: {subs}")
             self.transport.send(WSMsgType.TEXT, 
                 self.json.dumps({"action": "subscribe", "params": subs})
             )
@@ -220,7 +250,7 @@ class WebSocketClient:
         old_subs = self.subs.difference(self.scheduled_subs)
         if old_subs:
             subs = ",".join(old_subs)
-            logger.debug(f"unsubbing: {subs}")
+            logger.info(f"Unsubscribing from: {subs}")
             self.transport.send(WSMsgType.TEXT, 
                 self.json.dumps({"action": "unsubscribe", "params": subs})
             )
@@ -288,7 +318,7 @@ class WebSocketClient:
             topic, sym = self._parse_subscription(s)
             if topic == None:
                 continue
-            logger.debug("sub desired: %s", s)
+            logger.info("Adding subscription: %s", s)
             self.scheduled_subs.add(s)
             # If user subs to X.*, remove other X.\w+
             if sym == "*":
@@ -308,7 +338,7 @@ class WebSocketClient:
             topic, sym = self._parse_subscription(s)
             if topic == None:
                 continue
-            logger.debug("sub undesired: %s", s)
+            logger.info("Removing subscription: %s", s)
             self.scheduled_subs.discard(s)
 
             # If user unsubs to X.*, remove other X.\w+
