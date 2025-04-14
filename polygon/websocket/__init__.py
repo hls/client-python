@@ -23,8 +23,14 @@ class PolygonWSListener(WSListener):
         self.transport = None
         self.processor = None
         self.reconnects = 0
-        self.subscription_confirmed = False
-        self.last_subscription_time = None
+        self._full_msg = bytearray()
+        self._full_msg_type = None
+        
+    async def _delay_subscription(self):
+        # Wait for 3 seconds after authentication before subscribing
+        await asyncio.sleep(3)
+        if self.client.schedule_resub:
+            self.client._handle_subscriptions()
         
     def on_ws_connected(self, transport: WSTransport):
         """Called when WebSocket connection is established"""
@@ -35,20 +41,53 @@ class PolygonWSListener(WSListener):
     
     def on_ws_frame(self, transport: WSTransport, frame: WSFrame):
         """Called when a WebSocket frame is received"""
+        # Handle control frames
         if frame.msg_type == WSMsgType.CLOSE:
             close_code = frame.get_close_code()
             close_message = frame.get_close_message()
             logger.info(f"WebSocket connection closed: code={close_code}, reason={close_message}")
             transport.send_close(close_code)
             return
-            
-        if frame.msg_type != WSMsgType.TEXT:
-            logger.info(f"Received unexpected frame type: {frame.msg_type}")
+        elif frame.msg_type == WSMsgType.PING:
+            transport.send(WSMsgType.PONG, frame.get_payload_as_bytes())
+            return
+        elif frame.msg_type == WSMsgType.PONG:
+            # Just ignore pong frames
             return
             
-        message = frame.get_payload_as_ascii_text()
-        
-        # Process the message
+        # Handle data frames (with fragmentation support)
+        if frame.fin:
+            if self._full_msg:
+                # Last fragment of a fragmented message
+                if frame.msg_type == 0:  # Continuation frame
+                    self._full_msg.extend(frame.get_payload_as_memoryview())
+                    message = self._full_msg
+                    msg_type = self._full_msg_type
+                    self._full_msg = bytearray()
+                    self._full_msg_type = None
+                else:
+                    # This shouldn't happen - fin=True but not a continuation frame
+                    logger.warning(f"Unexpected frame type {frame.msg_type} with fin=True when processing fragmented message")
+                    self._full_msg = bytearray()
+                    self._full_msg_type = None
+                    return
+            else:
+                # Single-frame message
+                if frame.msg_type == WSMsgType.TEXT:
+                    message = frame.get_payload_as_memoryview()
+                    msg_type = WSMsgType.TEXT
+                else:
+                    logger.info(f"Ignoring unexpected frame type: {frame.msg_type}")
+                    return
+        else:
+            # Fragment (not final)
+            if not self._full_msg:
+                # First fragment
+                self._full_msg_type = frame.msg_type
+            self._full_msg.extend(frame.get_payload_as_memoryview())
+            return  # Wait for more fragments
+            
+        # Process the complete message
         try:
             # Handle potential JSON parsing errors more gracefully
             try:
@@ -90,9 +129,8 @@ class PolygonWSListener(WSListener):
                     return
                 elif msgJson[0]["status"] == "connected":
                     logger.info("Authentication successful")
-                    # Handle subscriptions after successful auth
-                    if self.client.schedule_resub:
-                        self.client._handle_subscriptions()
+                    # Add a delay before subscribing to ensure auth is fully processed
+                    asyncio.create_task(self._delay_subscription())
                     return
             
             # Handle regular messages
@@ -103,16 +141,7 @@ class PolygonWSListener(WSListener):
                         status_msg = m.get('message', '')
                         logger.info(f"Status message: {status_msg}")
                         
-                        # Check for subscription confirmation
-                        if 'successfully subscribed to' in status_msg.lower():
-                            logger.info("Subscription confirmed by Polygon")
-                            self.subscription_confirmed = True
-                        # Check for subscription failure
-                        elif 'failed' in status_msg.lower() and 'subscribe' in status_msg.lower():
-                            logger.error(f"Subscription failed: {status_msg}")
-                            # Trigger resubscription
-                            self.subscription_confirmed = False
-                            self.client.schedule_resub = True
+                        # Just log status messages without special handling
                         continue
                         
                 cmsg = parse(msgJson, logger)
@@ -123,7 +152,23 @@ class PolygonWSListener(WSListener):
                 asyncio.create_task(self.client.processor(cmsg))
                 
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
+            # Log the error with the message
+            try:
+                if isinstance(message, bytearray):
+                    message_str = message.decode('utf-8')
+                else:
+                    message_str = frame.get_payload_as_ascii_text()
+                
+                # Show beginning and end of long messages
+                if len(message_str) > 200:
+                    message_preview = f"{message_str[:100]} ... {message_str[-100:]}"
+                else:
+                    message_preview = message_str
+                    
+                logger.error(f"Error processing message: {e}\nMessage (len={len(message_str)}): {message_preview}")
+            except Exception as log_err:
+                logger.error(f"Error processing message: {e} (additionally, error logging message: {log_err})")
+                
             traceback.print_exc()
             
     def on_ws_disconnected(self, transport):
@@ -192,16 +237,7 @@ class WebSocketClient:
         else:
             self.json = json
 
-    async def _verify_subscription(self):
-        """Verify that subscriptions were successful and retry if needed"""
-        # Wait a reasonable time for subscription confirmation
-        await asyncio.sleep(5)
-        
-        # If we haven't received confirmation, try to resubscribe
-        if not self.listener.subscription_confirmed and self.scheduled_subs:
-            logger.warning("No subscription confirmation received, resubscribing...")
-            self.schedule_resub = True
-            self._handle_subscriptions()
+
     
     async def connect(
         self,
@@ -225,9 +261,7 @@ class WebSocketClient:
         # For picows, we don't need to explicitly pass SSL context
         # The library handles secure connections based on the URL scheme
         
-        # Reset subscription state on new connection
-        self.listener.subscription_confirmed = False
-        self.listener.last_subscription_time = None
+
         
         # Always resubscribe on reconnect
         self.schedule_resub = True
@@ -238,6 +272,7 @@ class WebSocketClient:
                 _, client = await ws_connect(
                     lambda: self.listener, 
                     self.url, 
+#                    max_frame_size=1024*1024,  # from 10K to 1MB
                     **kwargs
                 )
                 self.transport = client.transport
@@ -283,9 +318,7 @@ class WebSocketClient:
             self.transport.send(WSMsgType.TEXT, 
                 self.json.dumps({"action": "subscribe", "params": subs})
             )
-            # Record subscription time for verification
-            self.listener.last_subscription_time = asyncio.get_event_loop().time()
-            self.listener.subscription_confirmed = False
+
             
         # Handle unsubscriptions
         old_subs = self.subs.difference(self.scheduled_subs)
@@ -299,9 +332,7 @@ class WebSocketClient:
         self.subs = set(self.scheduled_subs)
         self.schedule_resub = False
         
-        # Set up a task to verify subscription was successful
-        if self.scheduled_subs:
-            asyncio.create_task(self._verify_subscription())
+
 
     def run(
         self,
