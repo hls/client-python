@@ -61,14 +61,15 @@ class PolygonWSListener(WSListener):
                 # Last fragment of a fragmented message
                 if frame.msg_type == 0:  # Continuation frame
                     self._full_msg.extend(frame.get_payload_as_memoryview())
-                    message = self._full_msg
+                    # Create a copy of the message before clearing the buffer
+                    message = bytearray(self._full_msg)
                     msg_type = self._full_msg_type
-                    self._full_msg = bytearray()
+                    self._full_msg.clear()
                     self._full_msg_type = None
                 else:
                     # This shouldn't happen - fin=True but not a continuation frame
                     logger.warning(f"Unexpected frame type {frame.msg_type} with fin=True when processing fragmented message")
-                    self._full_msg = bytearray()
+                    self._full_msg.clear()
                     self._full_msg_type = None
                     return
             else:
