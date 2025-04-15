@@ -61,11 +61,10 @@ class PolygonWSListener(WSListener):
                 # Last fragment of a fragmented message
                 if frame.msg_type == 0:  # Continuation frame
                     self._full_msg.extend(frame.get_payload_as_memoryview())
-                    # Create a copy of the message before clearing the buffer
-                    message = bytearray(self._full_msg)
+                    # Process the message directly without creating a copy
+                    message = self._full_msg
                     msg_type = self._full_msg_type
-                    self._full_msg.clear()
-                    self._full_msg_type = None
+                    # We'll clear the buffer after processing
                 else:
                     # This shouldn't happen - fin=True but not a continuation frame
                     logger.warning(f"Unexpected frame type {frame.msg_type} with fin=True when processing fragmented message")
@@ -94,20 +93,13 @@ class PolygonWSListener(WSListener):
             try:
                 msgJson = self.client.json.loads(message)
             except json.JSONDecodeError as json_err:
-                # Log detailed information about the JSON parsing error
                 error_pos = json_err.pos
-                # Get a snippet of the message around the error position
-                start_pos = max(0, error_pos - 50)
-                end_pos = min(len(message), error_pos + 50)
-                context = message[start_pos:end_pos]
-                
                 logger.error(f"JSON decode error at position {error_pos}: {json_err}")
-                # Removed verbose debug logging of message context
                 
                 # Try to recover by trimming the message if it appears to be truncated
                 if "unexpected end of data" in str(json_err):
                     # Find the last complete JSON object by looking for the last '}]' sequence
-                    last_complete = message.rfind('}]')
+                    last_complete = message.rfind(b'}]' if isinstance(message, (bytes, bytearray, memoryview)) else '}]')
                     if last_complete > 0:
                         try:
                             # Try parsing up to the last complete object
@@ -115,7 +107,6 @@ class PolygonWSListener(WSListener):
                             msgJson = self.client.json.loads(fixed_msg)
                             logger.info(f"Recovered from truncated JSON by trimming to length {len(fixed_msg)}")
                         except json.JSONDecodeError:
-                            # If recovery fails, re-raise the original error
                             raise json_err
                     else:
                         raise json_err
@@ -123,7 +114,7 @@ class PolygonWSListener(WSListener):
                     raise json_err
             
             # Handle auth response
-            if len(msgJson) > 0 and "status" in msgJson[0]:
+            if msgJson and isinstance(msgJson, list) and len(msgJson) > 0 and "status" in msgJson[0]:
                 if msgJson[0]["status"] == "auth_failed":
                     logger.error(f"Authentication failed: {msgJson[0]['message']}")
                     transport.send_close(WSCloseCode.PROTOCOL_ERROR)
@@ -136,41 +127,35 @@ class PolygonWSListener(WSListener):
             
             # Handle regular messages
             if not self.client.raw:
+                has_status_messages = False  # Initialize the variable
                 for m in msgJson:
                     # Check for subscription status messages
                     if "ev" in m and m["ev"] == "status":
+                        has_status_messages = True
                         status_msg = m.get('message', '')
                         logger.info(f"Status message: {status_msg}")
-                        
-                        # Just log status messages without special handling
-                        continue
-                        
-                cmsg = parse(msgJson, logger)
+                
+                # Only parse if we have messages to process
+                if msgJson and (not has_status_messages or len(msgJson) > 1):
+                    cmsg = parse(msgJson, logger)
+                else:
+                    cmsg = []
             else:
                 cmsg = message
                 
-            if len(cmsg) > 0 and self.client.processor:
+            if cmsg and len(cmsg) > 0 and self.client.processor:
+                # Create a task for async processing
                 asyncio.create_task(self.client.processor(cmsg))
                 
         except Exception as e:
-            # Log the error with the message
-            try:
-                if isinstance(message, bytearray):
-                    message_str = message.decode('utf-8')
-                else:
-                    message_str = frame.get_payload_as_ascii_text()
-                
-                # Show beginning and end of long messages
-                if len(message_str) > 200:
-                    message_preview = f"{message_str[:100]} ... {message_str[-100:]}"
-                else:
-                    message_preview = message_str
-                    
-                logger.error(f"Error processing message: {e}\nMessage (len={len(message_str)}): {message_preview}")
-            except Exception as log_err:
-                logger.error(f"Error processing message: {e} (additionally, error logging message: {log_err})")
-                
+            # Log the error with minimal message details
+            logger.error(f"Error processing message: {e}")
             traceback.print_exc()
+        finally:
+            # Clear the buffer if we were using a fragmented message
+            if self._full_msg and msg_type == self._full_msg_type:
+                self._full_msg.clear()
+                self._full_msg_type = None
             
     def on_ws_disconnected(self, transport):
         """Called when WebSocket connection is closed"""
